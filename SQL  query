@@ -1,0 +1,161 @@
+------ Загальна діагностика для таблиці project.games_payments -----
+
+-- Загальна кількість рядків
+SELECT COUNT(*) AS total_rows
+FROM project.games_payments;
+
+-- Кількість УНІКАЛЬНИХ платежів (без дублікатів)
+SELECT COUNT(DISTINCT (user_id, game_name, payment_date, revenue_amount_usd)) AS unique_rows
+FROM project.games_payments;
+
+-- Кількість NULL по кожному полю
+SELECT
+    COUNT(*) FILTER (WHERE user_id IS NULL) AS null_user_id,
+    COUNT(*) FILTER (WHERE game_name IS NULL) AS null_game_name,
+    COUNT(*) FILTER (WHERE payment_date IS NULL) AS null_payment_date,
+    COUNT(*) FILTER (WHERE revenue_amount_usd IS NULL) AS null_revenue
+FROM project.games_payments;
+
+-- Кількість повних дублікатів (однакові всі 4 поля)
+SELECT
+    user_id, game_name, payment_date, revenue_amount_usd,
+    COUNT(*) AS duplicate_count
+FROM project.games_payments
+GROUP BY user_id, game_name, payment_date, revenue_amount_usd
+HAVING COUNT(*) > 1
+ORDER BY duplicate_count DESC;
+
+-- Аномальні суми (нульові/від'ємні/екстремальні)
+SELECT
+    COUNT(*) FILTER (WHERE revenue_amount_usd = 0) AS zero_revenue,
+    COUNT(*) FILTER (WHERE revenue_amount_usd < 0) AS negative_revenue,
+    MIN(revenue_amount_usd) AS min_revenue,
+    MAX(revenue_amount_usd) AS max_revenue,
+    ROUND(AVG(revenue_amount_usd)::numeric, 2) AS avg_revenue
+FROM project.games_payments;
+
+
+------ Загальна діагностика для таблиці project.games_paid_users -----
+
+-- Загальна кількість рядків
+SELECT COUNT(*) AS total_rows
+FROM project.games_paid_users;
+
+-- Кількість унікальних user_id
+SELECT COUNT(DISTINCT user_id) AS unique_user_ids
+FROM project.games_paid_users;
+
+-- Кількість NULL по кожному полю
+SELECT
+    COUNT(*) FILTER (WHERE user_id IS NULL) AS null_user_id,
+    COUNT(*) FILTER (WHERE game_name IS NULL) AS null_game_name,
+    COUNT(*) FILTER (WHERE language IS NULL) AS null_language,
+    COUNT(*) FILTER (WHERE has_older_device_model IS NULL) AS null_device,
+    COUNT(*) FILTER (WHERE age IS NULL) AS null_age
+FROM project.games_paid_users;
+
+-- Повні дублікати (однакові всі поля)
+SELECT
+    user_id, game_name, language, has_older_device_model, age,
+    COUNT(*) AS duplicate_count
+FROM project.games_paid_users
+GROUP BY user_id, game_name, language, has_older_device_model, age
+HAVING COUNT(*) > 1
+ORDER BY duplicate_count DESC;
+
+-- Перевірка значень language (унікальні варіанти)
+SELECT DISTINCT language
+FROM project.games_paid_users;
+
+-- Перевірка діапазону age (аномалії: занадто малий/великий вік)
+SELECT
+    MIN(age) AS min_age,
+    MAX(age) AS max_age,
+    ROUND(AVG(age)::numeric, 1) AS avg_age
+FROM project.games_paid_users;
+
+
+----- Фінальний запит ----
+WITH clean_payments AS (
+    SELECT DISTINCT *
+    FROM project.games_payments
+),
+monthly_revenue AS (
+    SELECT
+        user_id,
+        DATE_TRUNC('month', payment_date)::date AS payment_month,
+        SUM(revenue_amount_usd) AS revenue
+    FROM clean_payments
+    GROUP BY user_id, DATE_TRUNC('month', payment_date)::date
+),
+user_first_month AS (
+    SELECT user_id, MIN(payment_month) AS first_month
+    FROM monthly_revenue
+    GROUP BY user_id
+),
+calendar AS (
+    SELECT generate_series(
+        (SELECT MIN(payment_month) FROM monthly_revenue),
+        (SELECT MAX(payment_month) FROM monthly_revenue),
+        INTERVAL '1 month'
+    )::date AS calendar_month
+),
+user_calendar AS (
+    SELECT uf.user_id, c.calendar_month, uf.first_month
+    FROM user_first_month uf
+    JOIN calendar c
+        ON c.calendar_month >= uf.first_month
+),
+user_month_revenue AS (
+    SELECT
+        uc.user_id,
+        uc.calendar_month,
+        uc.first_month,
+        mr.revenue
+    FROM user_calendar uc
+    LEFT JOIN monthly_revenue mr
+        ON mr.user_id = uc.user_id
+       AND mr.payment_month = uc.calendar_month
+),
+with_lag AS (
+    SELECT
+        *,
+        LAG(revenue) OVER (PARTITION BY user_id ORDER BY calendar_month) AS prev_revenue
+    FROM user_month_revenue
+),
+flagged AS (
+    SELECT
+        user_id,
+        calendar_month AS payment_month,
+        revenue,
+        prev_revenue,
+        (calendar_month = first_month) AS is_new,
+        (revenue IS NULL AND prev_revenue IS NOT NULL) AS is_churned,
+        (revenue IS NOT NULL AND prev_revenue IS NULL AND calendar_month <> first_month) AS is_back_from_churn,
+        (revenue IS NOT NULL AND prev_revenue IS NOT NULL AND revenue > prev_revenue) AS is_expansion,
+        (revenue IS NOT NULL AND prev_revenue IS NOT NULL AND revenue < prev_revenue) AS is_contraction
+    FROM with_lag
+)
+SELECT
+    f.user_id,
+    f.payment_month,
+    f.revenue,
+    f.prev_revenue,
+    f.is_new,
+    f.is_churned,
+    f.is_back_from_churn,
+    f.is_expansion,
+    f.is_contraction,
+    u.language,
+    u.has_older_device_model,
+    u.age,
+    CASE
+        WHEN u.age < 18 THEN 'Under 18'
+        WHEN u.age BETWEEN 18 AND 24 THEN '18-24'
+        WHEN u.age BETWEEN 25 AND 34 THEN '25-34'
+        WHEN u.age BETWEEN 35 AND 44 THEN '35-44'
+        ELSE '45+'
+    END AS age_group
+FROM flagged f
+LEFT JOIN project.games_paid_users u
+    ON f.user_id = u.user_id;
